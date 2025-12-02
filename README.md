@@ -1,2 +1,0 @@
-# Chess
-Chess on telegram 
