@@ -1,0 +1,1835 @@
+================================================================================
+TELEGRAM CHESS WEBAPP - COMPLETE SOURCE CODE
+================================================================================
+
+To run this project:
+1. Create a folder and add these files
+2. Run: npm install express ws chess.js node-telegram-bot-api uuid
+3. Set environment variable: TELEGRAM_BOT_TOKEN=your_token_here
+4. Run: node server.js
+
+================================================================================
+FILE: package.json
+================================================================================
+
+{
+  "name": "telegram-chess-webapp",
+  "version": "1.0.0",
+  "description": "A real-time 1v1 chess game as a Telegram WebApp",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "chess.js": "^1.4.0",
+    "express": "^4.22.1",
+    "node-telegram-bot-api": "^0.64.0",
+    "uuid": "^9.0.1",
+    "ws": "^8.18.3"
+  }
+}
+
+================================================================================
+FILE: server.js
+================================================================================
+
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const TelegramBot = require('node-telegram-bot-api');
+const path = require('path');
+const GameManager = require('./src/gameManager');
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const gameManager = new GameManager();
+const playerConnections = new Map();
+
+app.use(express.static('public'));
+app.use(express.json());
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const WEBAPP_URL = process.env.REPLIT_DEV_DOMAIN 
+  ? `https://${process.env.REPLIT_DEV_DOMAIN}` 
+  : `https://${process.env.REPL_SLUG}.${process.env.REPL_OWNER}.repl.co`;
+
+let bot = null;
+
+if (TELEGRAM_TOKEN) {
+  bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+  
+  bot.onText(/\/start(?:\s|$)/, (msg) => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, 
+      'Welcome to Chess WebApp! Use /startgame to create a new game or /new to start fresh.',
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: 'Start New Game', callback_data: 'startgame' }
+          ]]
+        }
+      }
+    );
+  });
+
+  bot.onText(/\/startgame/, (msg) => {
+    createNewGame(msg);
+  });
+
+  bot.onText(/\/new/, (msg) => {
+    createNewGame(msg);
+  });
+
+  bot.on('callback_query', async (callbackQuery) => {
+    const action = callbackQuery.data;
+    const msg = callbackQuery.message;
+    const userId = callbackQuery.from.id;
+    const username = callbackQuery.from.username || callbackQuery.from.first_name;
+
+    if (action === 'startgame') {
+      createNewGame({ chat: msg.chat, from: callbackQuery.from });
+      bot.answerCallbackQuery(callbackQuery.id);
+    } else if (action.startsWith('join_')) {
+      const gameId = action.replace('join_', '');
+      const result = gameManager.joinGame(gameId, String(userId), username);
+      
+      if (result.success) {
+        bot.answerCallbackQuery(callbackQuery.id, { text: 'Joined game!' });
+        
+        const game = result.game;
+        const gameUrl = `${WEBAPP_URL}?gameId=${gameId}&playerId=${userId}`;
+        
+        bot.sendMessage(msg.chat.id, 
+          `Game started! ${game.white.username} (White) vs ${game.black.username} (Black)\n\nClick below to open the game:`,
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: 'Play Game', url: gameUrl }
+              ]]
+            }
+          }
+        );
+        
+        broadcastToGame(gameId, {
+          type: 'gameStarted',
+          gameState: gameManager.getGameState(gameId)
+        });
+      } else {
+        bot.answerCallbackQuery(callbackQuery.id, { 
+          text: result.error, 
+          show_alert: true 
+        });
+      }
+    }
+  });
+
+  function createNewGame(msg) {
+    const chatId = msg.chat.id;
+    const userId = String(msg.from.id);
+    const username = msg.from.username || msg.from.first_name;
+    
+    const game = gameManager.createGame(userId, username);
+    const creatorUrl = `${WEBAPP_URL}?gameId=${game.id}&playerId=${userId}`;
+    
+    bot.sendMessage(chatId, 
+      `Game created! Share this with a friend to play:\nGame ID: ${game.id}\n\n${username} is waiting as White...`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: 'Join Game', callback_data: `join_${game.id}` }],
+            [{ text: 'Open Game (Creator)', url: creatorUrl }]
+          ]
+        }
+      }
+    );
+  }
+
+  console.log('Telegram bot started!');
+} else {
+  console.log('No TELEGRAM_BOT_TOKEN found. Bot features disabled.');
+  console.log('Set TELEGRAM_BOT_TOKEN environment variable to enable the bot.');
+}
+
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const gameId = url.searchParams.get('gameId');
+  const playerId = url.searchParams.get('playerId');
+  
+  if (!gameId || !playerId) {
+    ws.close(1008, 'Missing gameId or playerId');
+    return;
+  }
+  
+  const connectionKey = `${gameId}:${playerId}`;
+  playerConnections.set(connectionKey, ws);
+  
+  ws.gameId = gameId;
+  ws.playerId = playerId;
+  
+  let gameState = gameManager.getGameState(gameId);
+  
+  if (!gameState && gameId === 'demo') {
+    const game = gameManager.createGame('player1', 'Player 1');
+    gameManager.joinGame(game.id, 'player2', 'Player 2');
+    gameManager.games.delete(game.id);
+    game.id = 'demo';
+    game.status = 'playing';
+    gameManager.games.set('demo', game);
+    gameManager.playerToGame.set('player1', 'demo');
+    gameManager.playerToGame.set('player2', 'demo');
+    gameState = gameManager.getGameState('demo');
+  }
+  
+  if (gameState) {
+    ws.send(JSON.stringify({
+      type: 'gameState',
+      gameState,
+      playerColor: gameManager.getPlayerColor(gameId, playerId)
+    }));
+  }
+  
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      handleWebSocketMessage(ws, data);
+    } catch (error) {
+      console.error('WebSocket message error:', error);
+    }
+  });
+  
+  ws.on('close', () => {
+    playerConnections.delete(connectionKey);
+  });
+});
+
+function handleWebSocketMessage(ws, data) {
+  const { gameId, playerId } = ws;
+  
+  switch (data.type) {
+    case 'move': {
+      const result = gameManager.makeMove(gameId, playerId, data.from, data.to, data.promotion);
+      
+      if (result.success) {
+        broadcastToGame(gameId, {
+          type: 'moveMade',
+          from: data.from,
+          to: data.to,
+          promotion: data.promotion,
+          fen: result.fen,
+          gameStatus: result.gameStatus,
+          winner: result.winner,
+          isCheck: result.isCheck,
+          turn: result.turn,
+          san: result.move.san
+        });
+      } else {
+        ws.send(JSON.stringify({
+          type: 'moveError',
+          error: result.error
+        }));
+      }
+      break;
+    }
+    
+    case 'getLegalMoves': {
+      const moves = gameManager.getLegalMoves(gameId, data.square);
+      ws.send(JSON.stringify({
+        type: 'legalMoves',
+        square: data.square,
+        moves: moves.map(m => m.to)
+      }));
+      break;
+    }
+    
+    case 'resign': {
+      const result = gameManager.resign(gameId, playerId);
+      if (result.success) {
+        broadcastToGame(gameId, {
+          type: 'gameEnded',
+          reason: 'resignation',
+          winner: result.winner,
+          gameState: gameManager.getGameState(gameId)
+        });
+      }
+      break;
+    }
+    
+    case 'offerDraw': {
+      const result = gameManager.offerDraw(gameId, playerId);
+      if (result.success) {
+        broadcastToGame(gameId, {
+          type: 'drawOffered',
+          offeredBy: result.offeredBy
+        });
+      }
+      break;
+    }
+    
+    case 'acceptDraw': {
+      const result = gameManager.acceptDraw(gameId, playerId);
+      if (result.success) {
+        broadcastToGame(gameId, {
+          type: 'gameEnded',
+          reason: 'draw_agreement',
+          gameState: gameManager.getGameState(gameId)
+        });
+      }
+      break;
+    }
+    
+    case 'declineDraw': {
+      gameManager.declineDraw(gameId, playerId);
+      broadcastToGame(gameId, {
+        type: 'drawDeclined'
+      });
+      break;
+    }
+    
+    case 'requestUndo': {
+      const result = gameManager.requestUndo(gameId, playerId);
+      if (result.success) {
+        broadcastToGame(gameId, {
+          type: 'undoRequested',
+          requestedBy: result.requestedBy
+        });
+      }
+      break;
+    }
+    
+    case 'acceptUndo': {
+      const result = gameManager.acceptUndo(gameId, playerId);
+      if (result.success) {
+        broadcastToGame(gameId, {
+          type: 'undoAccepted',
+          fen: result.fen,
+          turn: result.turn
+        });
+      }
+      break;
+    }
+    
+    case 'declineUndo': {
+      gameManager.declineUndo(gameId, playerId);
+      broadcastToGame(gameId, {
+        type: 'undoDeclined'
+      });
+      break;
+    }
+  }
+}
+
+function broadcastToGame(gameId, message) {
+  const messageStr = JSON.stringify(message);
+  
+  for (const [key, ws] of playerConnections) {
+    if (key.startsWith(`${gameId}:`) && ws.readyState === WebSocket.OPEN) {
+      ws.send(messageStr);
+    }
+  }
+}
+
+app.get('/api/game/:gameId', (req, res) => {
+  const gameState = gameManager.getGameState(req.params.gameId);
+  if (gameState) {
+    res.json(gameState);
+  } else {
+    res.status(404).json({ error: 'Game not found' });
+  }
+});
+
+app.post('/api/game', (req, res) => {
+  const { playerId, username } = req.body;
+  const game = gameManager.createGame(playerId || 'guest', username || 'Guest');
+  res.json({ gameId: game.id, game: gameManager.getGameState(game.id) });
+});
+
+app.post('/api/game/:gameId/join', (req, res) => {
+  const { playerId, username } = req.body;
+  const result = gameManager.joinGame(req.params.gameId, playerId || 'guest2', username || 'Guest2');
+  if (result.success) {
+    res.json({ game: gameManager.getGameState(req.params.gameId) });
+  } else {
+    res.status(400).json({ error: result.error });
+  }
+});
+
+setInterval(() => {
+  gameManager.cleanupOldGames();
+}, 60 * 60 * 1000);
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`WebApp URL: ${WEBAPP_URL || `http://localhost:${PORT}`}`);
+});
+
+================================================================================
+FILE: src/gameManager.js
+================================================================================
+
+const { Chess } = require('chess.js');
+const { v4: uuidv4 } = require('uuid');
+
+class GameManager {
+  constructor() {
+    this.games = new Map();
+    this.playerToGame = new Map();
+  }
+
+  createGame(creatorId, creatorUsername) {
+    const gameId = uuidv4().substring(0, 8);
+    const game = {
+      id: gameId,
+      chess: new Chess(),
+      white: { id: creatorId, username: creatorUsername },
+      black: null,
+      status: 'waiting',
+      createdAt: Date.now(),
+      lastMoveAt: null,
+      moveHistory: [],
+      drawOffer: null,
+      undoRequest: null
+    };
+    
+    this.games.set(gameId, game);
+    this.playerToGame.set(creatorId, gameId);
+    
+    return game;
+  }
+
+  joinGame(gameId, playerId, playerUsername) {
+    const game = this.games.get(gameId);
+    
+    if (!game) {
+      return { success: false, error: 'Game not found' };
+    }
+    
+    if (game.status !== 'waiting') {
+      return { success: false, error: 'Game already started or ended' };
+    }
+    
+    if (game.white.id === playerId) {
+      return { success: false, error: 'You cannot join your own game' };
+    }
+    
+    game.black = { id: playerId, username: playerUsername };
+    game.status = 'playing';
+    this.playerToGame.set(playerId, gameId);
+    
+    return { success: true, game };
+  }
+
+  getGame(gameId) {
+    return this.games.get(gameId);
+  }
+
+  getGameByPlayer(playerId) {
+    const gameId = this.playerToGame.get(playerId);
+    return gameId ? this.games.get(gameId) : null;
+  }
+
+  getPlayerColor(gameId, playerId) {
+    const game = this.games.get(gameId);
+    if (!game) return null;
+    
+    if (game.white?.id === playerId) return 'white';
+    if (game.black?.id === playerId) return 'black';
+    return null;
+  }
+
+  makeMove(gameId, playerId, from, to, promotion = null) {
+    const game = this.games.get(gameId);
+    
+    if (!game) {
+      return { success: false, error: 'Game not found' };
+    }
+    
+    if (game.status !== 'playing') {
+      return { success: false, error: 'Game is not in progress' };
+    }
+    
+    const playerColor = this.getPlayerColor(gameId, playerId);
+    if (!playerColor) {
+      return { success: false, error: 'You are not in this game' };
+    }
+    
+    const turn = game.chess.turn() === 'w' ? 'white' : 'black';
+    if (turn !== playerColor) {
+      return { success: false, error: 'Not your turn' };
+    }
+    
+    try {
+      const moveOptions = { from, to };
+      if (promotion) {
+        moveOptions.promotion = promotion;
+      }
+      
+      const move = game.chess.move(moveOptions);
+      
+      if (!move) {
+        return { success: false, error: 'Invalid move' };
+      }
+      
+      game.moveHistory.push({
+        from,
+        to,
+        promotion,
+        fen: game.chess.fen(),
+        san: move.san
+      });
+      
+      game.lastMoveAt = Date.now();
+      game.drawOffer = null;
+      game.undoRequest = null;
+      
+      let gameStatus = 'playing';
+      let winner = null;
+      
+      if (game.chess.isCheckmate()) {
+        gameStatus = 'checkmate';
+        winner = playerColor;
+        game.status = 'ended';
+        game.winner = winner;
+        game.endReason = 'checkmate';
+      } else if (game.chess.isStalemate()) {
+        gameStatus = 'stalemate';
+        game.status = 'ended';
+        game.endReason = 'stalemate';
+      } else if (game.chess.isDraw()) {
+        gameStatus = 'draw';
+        game.status = 'ended';
+        game.endReason = 'draw';
+      } else if (game.chess.isCheck()) {
+        gameStatus = 'check';
+      }
+      
+      return {
+        success: true,
+        move,
+        fen: game.chess.fen(),
+        gameStatus,
+        winner,
+        isCheck: game.chess.isCheck(),
+        turn: game.chess.turn() === 'w' ? 'white' : 'black'
+      };
+    } catch (error) {
+      return { success: false, error: 'Invalid move' };
+    }
+  }
+
+  getLegalMoves(gameId, square) {
+    const game = this.games.get(gameId);
+    if (!game) return [];
+    
+    return game.chess.moves({ square, verbose: true });
+  }
+
+  resign(gameId, playerId) {
+    const game = this.games.get(gameId);
+    
+    if (!game || game.status !== 'playing') {
+      return { success: false, error: 'Game not in progress' };
+    }
+    
+    const playerColor = this.getPlayerColor(gameId, playerId);
+    if (!playerColor) {
+      return { success: false, error: 'You are not in this game' };
+    }
+    
+    game.status = 'ended';
+    game.winner = playerColor === 'white' ? 'black' : 'white';
+    game.endReason = 'resignation';
+    
+    return { success: true, winner: game.winner };
+  }
+
+  offerDraw(gameId, playerId) {
+    const game = this.games.get(gameId);
+    
+    if (!game || game.status !== 'playing') {
+      return { success: false, error: 'Game not in progress' };
+    }
+    
+    const playerColor = this.getPlayerColor(gameId, playerId);
+    if (!playerColor) {
+      return { success: false, error: 'You are not in this game' };
+    }
+    
+    game.drawOffer = playerColor;
+    
+    return { success: true, offeredBy: playerColor };
+  }
+
+  acceptDraw(gameId, playerId) {
+    const game = this.games.get(gameId);
+    
+    if (!game || game.status !== 'playing') {
+      return { success: false, error: 'Game not in progress' };
+    }
+    
+    const playerColor = this.getPlayerColor(gameId, playerId);
+    if (!playerColor) {
+      return { success: false, error: 'You are not in this game' };
+    }
+    
+    if (!game.drawOffer || game.drawOffer === playerColor) {
+      return { success: false, error: 'No draw offer to accept' };
+    }
+    
+    game.status = 'ended';
+    game.endReason = 'draw_agreement';
+    
+    return { success: true };
+  }
+
+  declineDraw(gameId, playerId) {
+    const game = this.games.get(gameId);
+    
+    if (!game) {
+      return { success: false, error: 'Game not found' };
+    }
+    
+    game.drawOffer = null;
+    
+    return { success: true };
+  }
+
+  requestUndo(gameId, playerId) {
+    const game = this.games.get(gameId);
+    
+    if (!game || game.status !== 'playing') {
+      return { success: false, error: 'Game not in progress' };
+    }
+    
+    if (game.moveHistory.length === 0) {
+      return { success: false, error: 'No moves to undo' };
+    }
+    
+    const playerColor = this.getPlayerColor(gameId, playerId);
+    if (!playerColor) {
+      return { success: false, error: 'You are not in this game' };
+    }
+    
+    game.undoRequest = playerColor;
+    
+    return { success: true, requestedBy: playerColor };
+  }
+
+  acceptUndo(gameId, playerId) {
+    const game = this.games.get(gameId);
+    
+    if (!game || game.status !== 'playing') {
+      return { success: false, error: 'Game not in progress' };
+    }
+    
+    const playerColor = this.getPlayerColor(gameId, playerId);
+    if (!playerColor) {
+      return { success: false, error: 'You are not in this game' };
+    }
+    
+    if (!game.undoRequest || game.undoRequest === playerColor) {
+      return { success: false, error: 'No undo request to accept' };
+    }
+    
+    game.chess.undo();
+    game.moveHistory.pop();
+    game.undoRequest = null;
+    
+    return { 
+      success: true, 
+      fen: game.chess.fen(),
+      turn: game.chess.turn() === 'w' ? 'white' : 'black'
+    };
+  }
+
+  declineUndo(gameId, playerId) {
+    const game = this.games.get(gameId);
+    
+    if (!game) {
+      return { success: false, error: 'Game not found' };
+    }
+    
+    game.undoRequest = null;
+    
+    return { success: true };
+  }
+
+  getGameState(gameId) {
+    const game = this.games.get(gameId);
+    if (!game) return null;
+    
+    return {
+      id: game.id,
+      fen: game.chess.fen(),
+      status: game.status,
+      turn: game.chess.turn() === 'w' ? 'white' : 'black',
+      white: game.white,
+      black: game.black,
+      isCheck: game.chess.isCheck(),
+      isCheckmate: game.chess.isCheckmate(),
+      isStalemate: game.chess.isStalemate(),
+      isDraw: game.chess.isDraw(),
+      winner: game.winner,
+      endReason: game.endReason,
+      drawOffer: game.drawOffer,
+      undoRequest: game.undoRequest,
+      moveHistory: game.moveHistory
+    };
+  }
+
+  removeGame(gameId) {
+    const game = this.games.get(gameId);
+    if (game) {
+      if (game.white) this.playerToGame.delete(game.white.id);
+      if (game.black) this.playerToGame.delete(game.black.id);
+      this.games.delete(gameId);
+    }
+  }
+
+  cleanupOldGames(maxAgeMs = 24 * 60 * 60 * 1000) {
+    const now = Date.now();
+    for (const [gameId, game] of this.games) {
+      if (now - game.createdAt > maxAgeMs) {
+        this.removeGame(gameId);
+      }
+    }
+  }
+}
+
+module.exports = GameManager;
+
+================================================================================
+FILE: public/index.html
+================================================================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Chess Game</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <div id="game-info">
+        <span id="game-id"></span>
+        <span id="player-info"></span>
+      </div>
+      <div id="turn-indicator"></div>
+    </div>
+    
+    <div id="players-panel">
+      <div class="player-card" id="opponent-card">
+        <div class="player-name">Waiting...</div>
+        <div class="player-color"></div>
+      </div>
+    </div>
+    
+    <div id="board-container">
+      <div id="chessboard"></div>
+    </div>
+    
+    <div id="players-panel">
+      <div class="player-card" id="player-card">
+        <div class="player-name">You</div>
+        <div class="player-color"></div>
+      </div>
+    </div>
+    
+    <div id="status-message"></div>
+    
+    <div id="controls">
+      <button id="undo-btn" class="control-btn">Undo</button>
+      <button id="draw-btn" class="control-btn">Offer Draw</button>
+      <button id="resign-btn" class="control-btn danger">Resign</button>
+    </div>
+    
+    <div id="move-history">
+      <h3>Moves</h3>
+      <div id="moves-list"></div>
+    </div>
+  </div>
+  
+  <div id="promotion-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Choose Promotion</h3>
+      <div class="promotion-options">
+        <button class="promotion-piece" data-piece="q">&#9819;</button>
+        <button class="promotion-piece" data-piece="r">&#9820;</button>
+        <button class="promotion-piece" data-piece="b">&#9821;</button>
+        <button class="promotion-piece" data-piece="n">&#9822;</button>
+      </div>
+    </div>
+  </div>
+  
+  <div id="game-over-modal" class="modal hidden">
+    <div class="modal-content">
+      <h2 id="game-over-title">Game Over</h2>
+      <p id="game-over-message"></p>
+      <button id="close-modal-btn" class="control-btn">Close</button>
+    </div>
+  </div>
+  
+  <div id="request-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3 id="request-title"></h3>
+      <p id="request-message"></p>
+      <div class="modal-buttons">
+        <button id="accept-request-btn" class="control-btn">Accept</button>
+        <button id="decline-request-btn" class="control-btn danger">Decline</button>
+      </div>
+    </div>
+  </div>
+  
+  <div id="waiting-screen" class="hidden">
+    <div class="waiting-content">
+      <h2>Waiting for opponent...</h2>
+      <p>Share the game link with a friend to start playing!</p>
+      <div class="spinner"></div>
+    </div>
+  </div>
+  
+  <script src="/js/app.js"></script>
+</body>
+</html>
+
+================================================================================
+FILE: public/css/style.css
+================================================================================
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --light-square: #f0d9b5;
+  --dark-square: #b58863;
+  --highlight: rgba(255, 255, 0, 0.4);
+  --legal-move: rgba(0, 255, 0, 0.3);
+  --last-move: rgba(155, 199, 0, 0.41);
+  --check: rgba(255, 0, 0, 0.5);
+  --bg-primary: #312e2b;
+  --bg-secondary: #272522;
+  --text-primary: #fff;
+  --text-secondary: #bababa;
+  --accent: #81b64c;
+  --danger: #e74c3c;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px;
+}
+
+#app {
+  width: 100%;
+  max-width: 500px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+#header {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+}
+
+#game-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+#game-id {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+#player-info {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+#turn-indicator {
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-weight: bold;
+  font-size: 14px;
+}
+
+#turn-indicator.white {
+  background: #fff;
+  color: #000;
+}
+
+#turn-indicator.black {
+  background: #000;
+  color: #fff;
+}
+
+#players-panel {
+  width: 100%;
+}
+
+.player-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+}
+
+.player-name {
+  font-weight: 500;
+}
+
+.player-color {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid var(--text-secondary);
+}
+
+.player-color.white {
+  background: #fff;
+}
+
+.player-color.black {
+  background: #000;
+}
+
+#board-container {
+  width: 100%;
+  max-width: 400px;
+  aspect-ratio: 1;
+  position: relative;
+}
+
+#chessboard {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+  border: 3px solid var(--bg-secondary);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.square {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+}
+
+.square.light {
+  background-color: var(--light-square);
+}
+
+.square.dark {
+  background-color: var(--dark-square);
+}
+
+.square.selected {
+  background-color: var(--highlight) !important;
+}
+
+.square.legal-move::after {
+  content: '';
+  position: absolute;
+  width: 30%;
+  height: 30%;
+  background-color: var(--legal-move);
+  border-radius: 50%;
+}
+
+.square.legal-capture::after {
+  content: '';
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border: 5px solid var(--legal-move);
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+
+.square.last-move {
+  background-color: var(--last-move) !important;
+}
+
+.square.check {
+  background: radial-gradient(ellipse at center, var(--check) 0%, var(--check) 25%, transparent 89%);
+}
+
+.piece {
+  font-size: calc(min(12.5vw, 42px));
+  line-height: 1;
+  pointer-events: none;
+  transition: transform 0.1s ease;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  filter: drop-shadow(1px 1px 1px rgba(0, 0, 0, 0.2));
+}
+
+.square.dragging .piece {
+  transform: scale(1.1);
+  opacity: 0.8;
+}
+
+.coordinate {
+  position: absolute;
+  font-size: 10px;
+  font-weight: bold;
+  pointer-events: none;
+}
+
+.coordinate.file {
+  bottom: 2px;
+  right: 4px;
+}
+
+.coordinate.rank {
+  top: 2px;
+  left: 4px;
+}
+
+.square.light .coordinate {
+  color: var(--dark-square);
+}
+
+.square.dark .coordinate {
+  color: var(--light-square);
+}
+
+#status-message {
+  width: 100%;
+  text-align: center;
+  padding: 8px;
+  font-size: 14px;
+  color: var(--text-secondary);
+  min-height: 30px;
+}
+
+#status-message.check {
+  color: var(--danger);
+  font-weight: bold;
+}
+
+#controls {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  justify-content: center;
+}
+
+.control-btn {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  transition: background 0.2s, transform 0.1s;
+}
+
+.control-btn:hover {
+  background: #3a3835;
+}
+
+.control-btn:active {
+  transform: scale(0.98);
+}
+
+.control-btn.danger {
+  background: var(--danger);
+}
+
+.control-btn.danger:hover {
+  background: #c0392b;
+}
+
+.control-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+#move-history {
+  width: 100%;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 10px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+#move-history h3 {
+  font-size: 14px;
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+}
+
+#moves-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.move-pair {
+  display: flex;
+  gap: 8px;
+  margin-right: 10px;
+}
+
+.move-number {
+  color: var(--text-secondary);
+}
+
+.move {
+  color: var(--text-primary);
+}
+
+.modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.modal.hidden {
+  display: none;
+}
+
+.modal-content {
+  background: var(--bg-secondary);
+  padding: 24px;
+  border-radius: 12px;
+  text-align: center;
+  max-width: 300px;
+  width: 90%;
+}
+
+.modal-content h2 {
+  margin-bottom: 12px;
+}
+
+.modal-content h3 {
+  margin-bottom: 16px;
+}
+
+.modal-content p {
+  color: var(--text-secondary);
+  margin-bottom: 20px;
+}
+
+.promotion-options {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+
+.promotion-piece {
+  width: 60px;
+  height: 60px;
+  font-size: 40px;
+  border: none;
+  border-radius: 8px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.2s, transform 0.1s;
+}
+
+.promotion-piece:hover {
+  background: #3a3835;
+  transform: scale(1.05);
+}
+
+.modal-buttons {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+
+#waiting-screen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--bg-primary);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 999;
+}
+
+#waiting-screen.hidden {
+  display: none;
+}
+
+.waiting-content {
+  text-align: center;
+  padding: 20px;
+}
+
+.waiting-content h2 {
+  margin-bottom: 10px;
+}
+
+.waiting-content p {
+  color: var(--text-secondary);
+  margin-bottom: 20px;
+}
+
+.spinner {
+  width: 40px;
+  height: 40px;
+  margin: 0 auto;
+  border: 4px solid var(--bg-secondary);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 400px) {
+  body {
+    padding: 5px;
+  }
+  
+  .control-btn {
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+  
+  #header {
+    padding: 8px;
+  }
+}
+
+================================================================================
+FILE: public/js/app.js
+================================================================================
+
+const PIECE_SYMBOLS = {
+  'wK': '\u2654', 'wQ': '\u2655', 'wR': '\u2656', 'wB': '\u2657', 'wN': '\u2658', 'wP': '\u2659',
+  'bK': '\u265A', 'bQ': '\u265B', 'bR': '\u265C', 'bB': '\u265D', 'bN': '\u265E', 'bP': '\u265F'
+};
+
+const PROMOTION_PIECES = {
+  'q': { white: '\u2655', black: '\u265B' },
+  'r': { white: '\u2656', black: '\u265C' },
+  'b': { white: '\u2657', black: '\u265D' },
+  'n': { white: '\u2658', black: '\u265E' }
+};
+
+class ChessGame {
+  constructor() {
+    this.gameId = null;
+    this.playerId = null;
+    this.playerColor = null;
+    this.ws = null;
+    this.selectedSquare = null;
+    this.legalMoves = [];
+    this.lastMove = null;
+    this.gameState = null;
+    this.pendingPromotion = null;
+    this.isFlipped = false;
+    this.moveHistory = [];
+    
+    this.init();
+  }
+  
+  init() {
+    this.parseUrlParams();
+    this.setupBoard();
+    this.setupEventListeners();
+    this.updateBoard('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1');
+    this.connectWebSocket();
+  }
+  
+  parseUrlParams() {
+    const params = new URLSearchParams(window.location.search);
+    this.gameId = params.get('gameId');
+    this.playerId = params.get('playerId');
+    
+    if (!this.gameId) {
+      this.gameId = 'demo';
+      this.playerId = 'player1';
+    }
+    
+    document.getElementById('game-id').textContent = `Game: ${this.gameId}`;
+  }
+  
+  setupBoard() {
+    const board = document.getElementById('chessboard');
+    board.innerHTML = '';
+    
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const displayRow = this.isFlipped ? 7 - row : row;
+        const displayCol = this.isFlipped ? 7 - col : col;
+        
+        const file = String.fromCharCode(97 + displayCol);
+        const rank = 8 - displayRow;
+        const square = file + rank;
+        
+        const div = document.createElement('div');
+        div.className = `square ${(row + col) % 2 === 0 ? 'light' : 'dark'}`;
+        div.dataset.square = square;
+        
+        if (col === 0) {
+          const rankCoord = document.createElement('span');
+          rankCoord.className = 'coordinate rank';
+          rankCoord.textContent = rank;
+          div.appendChild(rankCoord);
+        }
+        
+        if (row === 7) {
+          const fileCoord = document.createElement('span');
+          fileCoord.className = 'coordinate file';
+          fileCoord.textContent = file;
+          div.appendChild(fileCoord);
+        }
+        
+        board.appendChild(div);
+      }
+    }
+  }
+  
+  setupEventListeners() {
+    const board = document.getElementById('chessboard');
+    board.addEventListener('click', (e) => this.handleSquareClick(e));
+    
+    document.getElementById('undo-btn').addEventListener('click', () => this.requestUndo());
+    document.getElementById('draw-btn').addEventListener('click', () => this.offerDraw());
+    document.getElementById('resign-btn').addEventListener('click', () => this.resign());
+    
+    document.querySelectorAll('.promotion-piece').forEach(btn => {
+      btn.addEventListener('click', () => this.handlePromotion(btn.dataset.piece));
+    });
+    
+    document.getElementById('close-modal-btn').addEventListener('click', () => {
+      document.getElementById('game-over-modal').classList.add('hidden');
+    });
+    
+    document.getElementById('accept-request-btn').addEventListener('click', () => {
+      this.handleRequestAccept();
+    });
+    
+    document.getElementById('decline-request-btn').addEventListener('click', () => {
+      this.handleRequestDecline();
+    });
+  }
+  
+  connectWebSocket() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}?gameId=${this.gameId}&playerId=${this.playerId}`;
+    
+    this.ws = new WebSocket(wsUrl);
+    
+    this.ws.onopen = () => {
+      console.log('WebSocket connected');
+    };
+    
+    this.ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      this.handleServerMessage(data);
+    };
+    
+    this.ws.onclose = () => {
+      console.log('WebSocket disconnected');
+      setTimeout(() => this.connectWebSocket(), 3000);
+    };
+    
+    this.ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+  }
+  
+  handleServerMessage(data) {
+    switch (data.type) {
+      case 'gameState':
+        this.gameState = data.gameState;
+        this.playerColor = data.playerColor;
+        this.isFlipped = this.playerColor === 'black';
+        this.setupBoard();
+        this.updateBoard(data.gameState.fen);
+        this.updateUI();
+        this.updateMoveHistory(data.gameState.moveHistory || []);
+        
+        if (data.gameState.status === 'waiting') {
+          document.getElementById('waiting-screen').classList.remove('hidden');
+        } else {
+          document.getElementById('waiting-screen').classList.add('hidden');
+        }
+        break;
+        
+      case 'gameStarted':
+        this.gameState = data.gameState;
+        document.getElementById('waiting-screen').classList.add('hidden');
+        this.updateBoard(data.gameState.fen);
+        this.updateUI();
+        break;
+        
+      case 'moveMade':
+        this.lastMove = { from: data.from, to: data.to };
+        this.gameState.fen = data.fen;
+        this.gameState.turn = data.turn;
+        this.gameState.isCheck = data.isCheck;
+        this.updateBoard(data.fen);
+        this.updateUI();
+        this.addMove(data.san);
+        this.clearSelection();
+        
+        if (data.gameStatus === 'checkmate' || data.gameStatus === 'stalemate' || data.gameStatus === 'draw') {
+          this.showGameOver(data.gameStatus, data.winner);
+        }
+        break;
+        
+      case 'moveError':
+        this.showStatus(data.error, true);
+        this.clearSelection();
+        break;
+        
+      case 'legalMoves':
+        this.legalMoves = data.moves;
+        this.highlightLegalMoves();
+        break;
+        
+      case 'gameEnded':
+        this.gameState = data.gameState;
+        this.showGameOver(data.reason, data.winner);
+        break;
+        
+      case 'drawOffered':
+        if (data.offeredBy !== this.playerColor) {
+          this.showRequestModal('Draw Offered', 'Your opponent offers a draw. Accept?', 'draw');
+        } else {
+          this.showStatus('Draw offer sent');
+        }
+        break;
+        
+      case 'drawDeclined':
+        this.showStatus('Draw declined');
+        break;
+        
+      case 'undoRequested':
+        if (data.requestedBy !== this.playerColor) {
+          this.showRequestModal('Undo Requested', 'Your opponent wants to undo the last move. Accept?', 'undo');
+        } else {
+          this.showStatus('Undo request sent');
+        }
+        break;
+        
+      case 'undoAccepted':
+        this.gameState.fen = data.fen;
+        this.gameState.turn = data.turn;
+        this.lastMove = null;
+        this.updateBoard(data.fen);
+        this.updateUI();
+        this.showStatus('Move undone');
+        this.removeLastMove();
+        break;
+        
+      case 'undoDeclined':
+        this.showStatus('Undo declined');
+        break;
+    }
+  }
+  
+  handleSquareClick(e) {
+    const square = e.target.closest('.square');
+    if (!square) return;
+    
+    const squareName = square.dataset.square;
+    
+    if (this.gameState?.status !== 'playing') return;
+    if (this.gameState?.turn !== this.playerColor) {
+      this.showStatus("Not your turn", true);
+      return;
+    }
+    
+    if (this.selectedSquare) {
+      if (this.legalMoves.includes(squareName)) {
+        this.makeMove(this.selectedSquare, squareName);
+      } else {
+        const piece = this.getPieceAt(squareName);
+        if (piece && this.isOwnPiece(piece)) {
+          this.selectSquare(squareName);
+        } else {
+          this.clearSelection();
+        }
+      }
+    } else {
+      const piece = this.getPieceAt(squareName);
+      if (piece && this.isOwnPiece(piece)) {
+        this.selectSquare(squareName);
+      }
+    }
+  }
+  
+  selectSquare(square) {
+    this.clearSelection();
+    this.selectedSquare = square;
+    
+    const squareEl = document.querySelector(`[data-square="${square}"]`);
+    if (squareEl) {
+      squareEl.classList.add('selected');
+    }
+    
+    this.ws.send(JSON.stringify({
+      type: 'getLegalMoves',
+      square: square
+    }));
+  }
+  
+  clearSelection() {
+    this.selectedSquare = null;
+    this.legalMoves = [];
+    
+    document.querySelectorAll('.square').forEach(sq => {
+      sq.classList.remove('selected', 'legal-move', 'legal-capture');
+    });
+  }
+  
+  highlightLegalMoves() {
+    this.legalMoves.forEach(move => {
+      const squareEl = document.querySelector(`[data-square="${move}"]`);
+      if (squareEl) {
+        const hasPiece = squareEl.querySelector('.piece');
+        squareEl.classList.add(hasPiece ? 'legal-capture' : 'legal-move');
+      }
+    });
+  }
+  
+  makeMove(from, to) {
+    const piece = this.getPieceAt(from);
+    const isPawn = piece && piece.toLowerCase() === 'p';
+    const isPromotion = isPawn && (to[1] === '8' || to[1] === '1');
+    
+    if (isPromotion) {
+      this.pendingPromotion = { from, to };
+      this.showPromotionModal();
+    } else {
+      this.sendMove(from, to);
+    }
+  }
+  
+  sendMove(from, to, promotion = null) {
+    this.ws.send(JSON.stringify({
+      type: 'move',
+      from,
+      to,
+      promotion
+    }));
+  }
+  
+  showPromotionModal() {
+    const modal = document.getElementById('promotion-modal');
+    const isWhite = this.playerColor === 'white';
+    
+    document.querySelectorAll('.promotion-piece').forEach(btn => {
+      const piece = btn.dataset.piece;
+      btn.textContent = isWhite ? PROMOTION_PIECES[piece].white : PROMOTION_PIECES[piece].black;
+    });
+    
+    modal.classList.remove('hidden');
+  }
+  
+  handlePromotion(piece) {
+    document.getElementById('promotion-modal').classList.add('hidden');
+    
+    if (this.pendingPromotion) {
+      this.sendMove(this.pendingPromotion.from, this.pendingPromotion.to, piece);
+      this.pendingPromotion = null;
+    }
+  }
+  
+  updateBoard(fen) {
+    const position = this.parseFen(fen);
+    
+    document.querySelectorAll('.square').forEach(square => {
+      const existingPiece = square.querySelector('.piece');
+      if (existingPiece) {
+        existingPiece.remove();
+      }
+      
+      square.classList.remove('last-move', 'check');
+    });
+    
+    for (const [squareName, piece] of Object.entries(position)) {
+      const squareEl = document.querySelector(`[data-square="${squareName}"]`);
+      if (squareEl && piece) {
+        const pieceEl = document.createElement('span');
+        pieceEl.className = 'piece';
+        pieceEl.textContent = PIECE_SYMBOLS[piece];
+        pieceEl.dataset.piece = piece;
+        squareEl.appendChild(pieceEl);
+      }
+    }
+    
+    if (this.lastMove) {
+      const fromEl = document.querySelector(`[data-square="${this.lastMove.from}"]`);
+      const toEl = document.querySelector(`[data-square="${this.lastMove.to}"]`);
+      if (fromEl) fromEl.classList.add('last-move');
+      if (toEl) toEl.classList.add('last-move');
+    }
+    
+    if (this.gameState?.isCheck) {
+      const kingColor = this.gameState.turn === 'white' ? 'wK' : 'bK';
+      for (const [squareName, piece] of Object.entries(position)) {
+        if (piece === kingColor) {
+          const squareEl = document.querySelector(`[data-square="${squareName}"]`);
+          if (squareEl) squareEl.classList.add('check');
+          break;
+        }
+      }
+    }
+  }
+  
+  parseFen(fen) {
+    const position = {};
+    const rows = fen.split(' ')[0].split('/');
+    
+    for (let row = 0; row < 8; row++) {
+      let col = 0;
+      for (const char of rows[row]) {
+        if (/\d/.test(char)) {
+          col += parseInt(char);
+        } else {
+          const file = String.fromCharCode(97 + col);
+          const rank = 8 - row;
+          const color = char === char.toUpperCase() ? 'w' : 'b';
+          const pieceType = char.toUpperCase();
+          position[file + rank] = color + pieceType;
+          col++;
+        }
+      }
+    }
+    
+    return position;
+  }
+  
+  getPieceAt(square) {
+    const squareEl = document.querySelector(`[data-square="${square}"]`);
+    const pieceEl = squareEl?.querySelector('.piece');
+    return pieceEl?.dataset?.piece || null;
+  }
+  
+  isOwnPiece(piece) {
+    if (!piece || !this.playerColor) return false;
+    const pieceColor = piece[0] === 'w' ? 'white' : 'black';
+    return pieceColor === this.playerColor;
+  }
+  
+  updateUI() {
+    const turn = this.gameState?.turn || 'white';
+    const turnIndicator = document.getElementById('turn-indicator');
+    turnIndicator.textContent = `${turn === 'white' ? "White's" : "Black's"} Move`;
+    turnIndicator.className = turn;
+    
+    const playerInfo = document.getElementById('player-info');
+    playerInfo.textContent = `You are ${this.playerColor || 'spectating'}`;
+    
+    const opponentCard = document.getElementById('opponent-card');
+    const playerCard = document.getElementById('player-card');
+    
+    if (this.gameState) {
+      const opponent = this.playerColor === 'white' ? this.gameState.black : this.gameState.white;
+      const player = this.playerColor === 'white' ? this.gameState.white : this.gameState.black;
+      
+      opponentCard.querySelector('.player-name').textContent = opponent?.username || 'Waiting...';
+      opponentCard.querySelector('.player-color').className = `player-color ${this.playerColor === 'white' ? 'black' : 'white'}`;
+      
+      playerCard.querySelector('.player-name').textContent = player?.username || 'You';
+      playerCard.querySelector('.player-color').className = `player-color ${this.playerColor}`;
+    }
+    
+    const isPlaying = this.gameState?.status === 'playing';
+    const isMyTurn = this.gameState?.turn === this.playerColor;
+    
+    document.getElementById('undo-btn').disabled = !isPlaying;
+    document.getElementById('draw-btn').disabled = !isPlaying;
+    document.getElementById('resign-btn').disabled = !isPlaying;
+    
+    if (this.gameState?.isCheck && isMyTurn) {
+      this.showStatus('Check!', true);
+    } else if (isPlaying) {
+      this.showStatus(isMyTurn ? 'Your turn' : "Opponent's turn");
+    }
+  }
+  
+  showStatus(message, isWarning = false) {
+    const status = document.getElementById('status-message');
+    status.textContent = message;
+    status.className = isWarning ? 'check' : '';
+  }
+  
+  showGameOver(reason, winner) {
+    const modal = document.getElementById('game-over-modal');
+    const title = document.getElementById('game-over-title');
+    const message = document.getElementById('game-over-message');
+    
+    let titleText = 'Game Over';
+    let messageText = '';
+    
+    switch (reason) {
+      case 'checkmate':
+        titleText = 'Checkmate!';
+        messageText = winner === this.playerColor ? 'You win!' : 'You lose!';
+        break;
+      case 'stalemate':
+        titleText = 'Stalemate';
+        messageText = "It's a draw!";
+        break;
+      case 'draw':
+      case 'draw_agreement':
+        titleText = 'Draw';
+        messageText = 'The game ended in a draw.';
+        break;
+      case 'resignation':
+        titleText = 'Resignation';
+        messageText = winner === this.playerColor ? 'Your opponent resigned. You win!' : 'You resigned.';
+        break;
+    }
+    
+    title.textContent = titleText;
+    message.textContent = messageText;
+    modal.classList.remove('hidden');
+    
+    document.getElementById('undo-btn').disabled = true;
+    document.getElementById('draw-btn').disabled = true;
+    document.getElementById('resign-btn').disabled = true;
+  }
+  
+  showRequestModal(title, message, requestType) {
+    const modal = document.getElementById('request-modal');
+    document.getElementById('request-title').textContent = title;
+    document.getElementById('request-message').textContent = message;
+    modal.dataset.requestType = requestType;
+    modal.classList.remove('hidden');
+  }
+  
+  handleRequestAccept() {
+    const modal = document.getElementById('request-modal');
+    const requestType = modal.dataset.requestType;
+    
+    if (requestType === 'draw') {
+      this.ws.send(JSON.stringify({ type: 'acceptDraw' }));
+    } else if (requestType === 'undo') {
+      this.ws.send(JSON.stringify({ type: 'acceptUndo' }));
+    }
+    
+    modal.classList.add('hidden');
+  }
+  
+  handleRequestDecline() {
+    const modal = document.getElementById('request-modal');
+    const requestType = modal.dataset.requestType;
+    
+    if (requestType === 'draw') {
+      this.ws.send(JSON.stringify({ type: 'declineDraw' }));
+    } else if (requestType === 'undo') {
+      this.ws.send(JSON.stringify({ type: 'declineUndo' }));
+    }
+    
+    modal.classList.add('hidden');
+  }
+  
+  requestUndo() {
+    this.ws.send(JSON.stringify({ type: 'requestUndo' }));
+  }
+  
+  offerDraw() {
+    this.ws.send(JSON.stringify({ type: 'offerDraw' }));
+  }
+  
+  resign() {
+    if (confirm('Are you sure you want to resign?')) {
+      this.ws.send(JSON.stringify({ type: 'resign' }));
+    }
+  }
+  
+  updateMoveHistory(history) {
+    this.moveHistory = history.map(m => m.san);
+    this.renderMoveHistory();
+  }
+  
+  addMove(san) {
+    this.moveHistory.push(san);
+    this.renderMoveHistory();
+  }
+  
+  removeLastMove() {
+    this.moveHistory.pop();
+    this.renderMoveHistory();
+  }
+  
+  renderMoveHistory() {
+    const movesList = document.getElementById('moves-list');
+    movesList.innerHTML = '';
+    
+    for (let i = 0; i < this.moveHistory.length; i += 2) {
+      const moveNumber = Math.floor(i / 2) + 1;
+      const whiteMove = this.moveHistory[i];
+      const blackMove = this.moveHistory[i + 1];
+      
+      const pair = document.createElement('div');
+      pair.className = 'move-pair';
+      pair.innerHTML = `
+        <span class="move-number">${moveNumber}.</span>
+        <span class="move">${whiteMove}</span>
+        ${blackMove ? `<span class="move">${blackMove}</span>` : ''}
+      `;
+      movesList.appendChild(pair);
+    }
+    
+    movesList.scrollTop = movesList.scrollHeight;
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  window.game = new ChessGame();
+});
+
+================================================================================
+END OF SOURCE CODE
+================================================================================
